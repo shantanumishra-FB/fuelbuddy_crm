@@ -14,6 +14,32 @@ CONTRACT_SO_QUEUE = "long"
 # deliveries: next_qty = delivered_prev_month + delivered_prev_month * GROWTH = delivered * 1.25.
 CONTRACT_QTY_GROWTH = 0.25
 
+# Every SO-automation failure / timeout / no-SO outcome is written to the Error Log
+# under a title starting with this prefix, so they can all be filtered in one place
+# (List > Error Log, filter title "like Contract SO%").
+SO_LOG_PREFIX = "Contract SO"
+
+
+def _log_so(title, opportunity=None, quotation=None, detail=None, traceback=False):
+	"""Record an SO-automation outcome in the Error Log. Used for failures, RQ
+	timeouts and "expected an SO but produced none" cases so nothing fails
+	silently. Never raises -- logging must not break the caller."""
+	try:
+		parts = []
+		if opportunity:
+			parts.append(f"Opportunity: {opportunity}")
+		if quotation:
+			parts.append(f"Quotation: {quotation}")
+		if detail:
+			parts.append(str(detail))
+		if traceback:
+			parts.append(frappe.get_traceback())
+		message = "\n".join(parts) or title
+		# Error Log title is capped at 140 chars.
+		frappe.log_error(title=f"{SO_LOG_PREFIX}: {title}"[:140], message=message)
+	except Exception:
+		pass
+
 
 def on_quotation_submit(doc, method=None):
 	"""Quotation submit / update-after-submit hook -> start contract SO automation
@@ -25,31 +51,53 @@ def on_quotation_submit(doc, method=None):
 @frappe.whitelist()
 def create_sales_order_if_ready(opportunity):
 	"""If the Opportunity's Quotation AND Finance Dossier are both submitted, kick
-	off the current month's contract Sales Order (in the background). Idempotent."""
-	if not opportunity or not frappe.db.exists("Opportunity", opportunity):
-		return None
+	off the current month's contract Sales Order (in the background). Idempotent.
 
-	source = ready_contract_quotation(opportunity)
-	if not source:
-		return None
+	Never raises: this runs synchronously inside the Quotation / Finance Dossier
+	submit, so any failure here is logged to the Error Log instead of bubbling up
+	and rolling back (or 502-ing) the user's submit."""
+	try:
+		if not opportunity or not frappe.db.exists("Opportunity", opportunity):
+			return None
 
-	# Run SO creation/submission in the background (as Administrator) so the
-	# workflow "Approve" transition is permitted regardless of who submitted.
-	frappe.enqueue(
-		"fuelbuddy_crm.sales_automation.create_contract_month_so",
-		queue=CONTRACT_SO_QUEUE,
-		enqueue_after_commit=True,
-		quotation=source,
-		target_date=nowdate(),
-		set_stage=True,
-	)
-	return source
+		source, reason = _evaluate_contract_readiness(opportunity)
+		if not source:
+			# Not an error -- the Opportunity simply isn't ready yet (e.g. the
+			# Finance Dossier or Quotation is still in draft). Log at info level
+			# only, so the Error Log isn't flooded on every pre-FD submit.
+			frappe.logger("fuelbuddy_crm").info(
+				f"Contract SO not started for {opportunity}: {reason}"
+			)
+			return None
+
+		# Run SO creation/submission in the background (as Administrator) so the
+		# workflow "Approve" transition is permitted regardless of who submitted.
+		frappe.enqueue(
+			"fuelbuddy_crm.sales_automation.create_contract_month_so",
+			queue=CONTRACT_SO_QUEUE,
+			enqueue_after_commit=True,
+			quotation=source,
+			target_date=nowdate(),
+			set_stage=True,
+		)
+		return source
+	except Exception:
+		# e.g. the redis queue is unreachable so enqueue() fails.
+		_log_so("failed to queue SO creation", opportunity=opportunity, traceback=True)
+		return None
 
 
 def ready_contract_quotation(opportunity):
 	"""Return the single source Quotation name when the Opportunity is ready:
 	at least one submitted Quotation and at least one submitted Finance Dossier,
 	with none of them still in draft. Otherwise None."""
+	source, _reason = _evaluate_contract_readiness(opportunity)
+	return source
+
+
+def _evaluate_contract_readiness(opportunity):
+	"""Return (source_quotation_or_None, reason). `reason` is a short human string
+	explaining why it is not ready (used for logging) or "ready"."""
 	quotations = frappe.get_all(
 		"Quotation",
 		filters={"custom_opportunity_from": opportunity, "docstatus": ["!=", 2]},
@@ -61,28 +109,42 @@ def ready_contract_quotation(opportunity):
 		fields=["name", "docstatus"],
 	)
 
-	if not quotations or not dossiers:
-		return None
+	if not quotations:
+		return None, "no Quotation is linked to this Opportunity (custom_opportunity_from)"
+	if not dossiers:
+		return None, "no Finance Dossier is linked to this Opportunity (finance_dossier_from/id)"
 	if any(q.docstatus != 1 for q in quotations):
-		return None
+		return None, "a linked Quotation is still in Draft"
 	if any(d.docstatus != 1 for d in dossiers):
-		return None
+		return None, "a linked Finance Dossier is still in Draft"
 
 	# The latest submitted Quotation is the single contract source for the SOs.
-	return frappe.get_all(
+	source = frappe.get_all(
 		"Quotation",
 		filters={"name": ["in", [q.name for q in quotations]]},
 		order_by="creation desc",
 		limit=1,
 		pluck="name",
 	)[0]
+	return source, "ready"
 
 
 @frappe.whitelist()
 def create_contract_month_so(quotation, target_date=None, set_stage=False):
-	"""Create and submit one Sales Order for the month of `target_date` from a
-	contract Quotation. delivery_date = last day of that month. Idempotent per
-	(quotation, month); stops once the contract has expired."""
+	"""Public entrypoint (also the enqueued job). Creates and submits one Sales
+	Order for the month of `target_date` from a contract Quotation. Any failure or
+	RQ timeout is recorded in the Error Log (title "Contract SO: creation failed")
+	before being re-raised, so a background failure is never invisible."""
+	try:
+		return _create_contract_month_so(quotation, target_date=target_date, set_stage=set_stage)
+	except Exception:
+		_log_so("creation failed", quotation=quotation, traceback=True)
+		raise
+
+
+def _create_contract_month_so(quotation, target_date=None, set_stage=False):
+	"""Idempotent per (quotation, month); stops once the contract has expired.
+	Returns the SO name, or None when no SO is created (each None path is logged)."""
 	# Background jobs run as the enqueuing user; the SO workflow "Approve"
 	# transition needs System Manager, so act as Administrator.
 	if frappe.session.user != "Administrator":
@@ -94,11 +156,21 @@ def create_contract_month_so(quotation, target_date=None, set_stage=False):
 
 	qdoc = frappe.get_doc("Quotation", quotation)
 	if qdoc.docstatus != 1:
+		_log_so(
+			"skipped: source Quotation is not submitted",
+			quotation=quotation,
+			detail=f"docstatus={qdoc.docstatus}",
+		)
 		return None
 
 	# Stop once the contract has expired (no SO for months past expiry).
 	expiry = qdoc.get("custom_contract_expiry")
 	if expiry and getdate(expiry) < month_start:
+		_log_so(
+			"skipped: contract expired before this month",
+			quotation=quotation,
+			detail=f"custom_contract_expiry={expiry}, month_start={month_start}",
+		)
 		return None
 
 	# Idempotent: one Sales Order per (quotation, month).
@@ -134,9 +206,19 @@ def create_contract_month_so(quotation, target_date=None, set_stage=False):
 		# If the previous month had no SO or zero deliveries, skip this month entirely.
 		prev_so = _previous_month_so(quotation, month_start)
 		if not prev_so:
+			_log_so(
+				"skipped: no previous-month SO to grow this month's qty from",
+				quotation=quotation,
+				detail=f"month_start={month_start}",
+			)
 			return None
 		delivered = _delivered_qty_by_item(prev_so)
 		if not any(qty > 0 for qty in delivered.values()):
+			_log_so(
+				"skipped: previous month had zero deliveries",
+				quotation=quotation,
+				detail=f"prev_so={prev_so}",
+			)
 			return None
 
 		so = frappe.copy_doc(frappe.get_doc("Sales Order", template[0]))
@@ -215,11 +297,11 @@ def generate_monthly_contract_sales_orders():
 		if ready_contract_quotation(opportunity) != q:
 			continue
 		try:
-			create_contract_month_so(q, today, set_stage=False)
+			_create_contract_month_so(q, today, set_stage=False)
 			frappe.db.commit()
 		except Exception:
 			frappe.db.rollback()
-			frappe.log_error(title=f"Contract SO generation failed: {q}")
+			_log_so("monthly generation failed", quotation=q, traceback=True)
 
 
 def _previous_month_so(quotation, month_start):
